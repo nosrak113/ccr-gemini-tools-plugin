@@ -1,0 +1,16 @@
+# Runtime state and replay data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Node.js dependencies and diagnostics
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Local environment overrides
+.env
+.env.*
+!.env.example

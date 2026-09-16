@@ -1,0 +1,35 @@
+{
+  "plugins": [
+    {
+      "id": "ccr-gemini-agent",
+      "enabled": true,
+      "module": "<CCR_HOME>/plugins/gemini-agent/entry.cjs",
+      "surfaces": {
+        "apps": false,
+        "gateway": true,
+        "provider": false
+      },
+      "permissions": [
+        "trusted-code",
+        "gateway-routes"
+      ],
+      "config": {
+        "googleProviderName": "Google",
+        "desktopProfilePath": "<DESKTOP_PROFILE_PATH>"
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "gemini-agent",
+      "agent": "claude-code",
+      "surface": "cli",
+      "model": "GoogleAgent/claude-gemini-3.8-flash",
+      "opusModel": "GoogleAgent/claude-gemini-3.8-flash",
+      "sonnetModel": "GoogleAgent/claude-gemini-3.8-flash",
+      "fableModel": "GoogleAgent/claude-gemini-3.8-flash",
+      "haikuModel": "GoogleAgent/claude-gemini-3.5-flash-lite",
+      "smallFastModel": "GoogleAgent/claude-gemini-3.5-flash-lite"
+    }
+  ]
+}
