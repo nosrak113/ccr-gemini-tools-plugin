@@ -68,7 +68,7 @@ test("SSE errors are emitted and closed after headers have been sent", () => {
   bridge._test.sendSseError(response, Object.assign(new Error("upstream failed"), { type: "api_error" }));
   assert.match(output, /^event: error/m);
   assert.match(output, /upstream failed/);
-  assert.match(output, /event: message_stop/);
+  assert.doesNotMatch(output, /event: message_stop/);
   assert.equal(response.writableEnded, true);
 });
 
@@ -82,4 +82,18 @@ test("entry reload clears the lib module cache before loading index", () => {
   assert.equal(typeof reloaded.setup, "function");
   assert.equal(typeof require.cache[libPath].exports.GeminiClient, "function");
   assert.equal(require.cache[libPath].exports.stale, undefined);
+});
+
+test("returns 404 with Anthropic error envelope for unmapped models", async () => {
+  const fixture = makeContext({ exclusiveGatewayRoutes: true });
+  await bridge.setup(fixture.ctx);
+  const route = fixture.routes.find((candidate) => candidate.path === "/v1/messages");
+  const request = { headers: {} };
+  const response = new EventEmitter();
+  const body = { model: "unknown-model", messages: [{ role: "user", content: "hi" }] };
+  const result = await route.handler(request, response, jsonHelpers(body));
+  assert.equal(result.status, 404);
+  assert.equal(result.value.type, "error");
+  assert.equal(result.value.error.type, "not_found_error");
+  bridge.stop();
 });

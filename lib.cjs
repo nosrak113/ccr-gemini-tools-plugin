@@ -3,6 +3,7 @@
 const { createHash, randomUUID } = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { join } = require("node:path");
+const { setTimeout: sleep } = require("node:timers/promises");
 
 const MODELS = Object.freeze({
   primary: "gemini-3.8-flash",
@@ -54,13 +55,15 @@ function normalizeModel(model) {
   if (clean === "opus-4-5") return MODELS.preview;
   if (clean === "haiku-4-5") return MODELS.helper;
   if (clean === "haiku") return MODELS.helper;
-  if (!clean || clean === "default" || clean === "sonnet" || clean === "opus") return MODELS.primary;
+  if (!clean || clean === "default" || clean === "sonnet" || clean === "opus" || clean === "fable" || clean.startsWith("fable")) return MODELS.primary;
   if ([MODELS.primary, MODELS.preview, MODELS.helper].includes(clean)) return clean;
   throw fail(400, `Unsupported GoogleAgent model: ${model}`, "invalid_request_error");
 }
 
 function effortFor(model) {
-  return model === MODELS.helper ? "low" : "high";
+  if (model === MODELS.helper) return "low";
+  if (model === MODELS.primary || model === MODELS.preview) return "high";
+  return "none";
 }
 
 function turnText(message) {
@@ -79,18 +82,6 @@ function toolUses(message) {
   return Array.isArray(message?.content)
     ? message.content.filter((part) => part && part.type === "tool_use" && part.id && part.name)
     : [];
-}
-
-function toInteractionInput(body) {
-  const input = [];
-  for (const message of body.messages || []) {
-    const text = turnText(message);
-    if (!text) continue;
-    input.push(message.role === "assistant"
-      ? { type: "model_output", content: [{ type: "text", text }] }
-      : { type: "user_input", content: [{ type: "text", text }] });
-  }
-  return input.length ? input : [{ type: "user_input", content: [{ type: "text", text: "" }] }];
 }
 
 function systemInstruction(body) {
@@ -165,7 +156,9 @@ function functionCalls(interaction) {
   const calls = [];
   for (const step of interaction.steps || []) {
     if (step.type !== "function_call") continue;
-    calls.push({ id: step.id || step.call_id || randomUUID(), name: step.name, input: step.arguments || step.args || {} });
+    const id = step.id || step.call_id || randomUUID();
+    if (!step.id && !step.call_id) step.id = id;
+    calls.push({ id, name: step.name, input: step.arguments || step.args || {} });
   }
   return calls;
 }
@@ -209,9 +202,9 @@ class ReplayStore {
         // The transcript prefix then changes even though the function-call IDs
         // still identify the exact native interaction that must be replayed.
         if (!row && calls.length) {
-          const predicates = calls.map(() => "assistant_text LIKE ?").join(" AND ");
+          const predicates = calls.map(() => "instr(assistant_text, ?) > 0").join(" AND ");
           const candidates = this.db.prepare(`SELECT id, history_json FROM replays WHERE session_key = ? AND model = ? AND ${predicates} ORDER BY last_used_at DESC LIMIT 2`)
-            .all(sessionKey, model, ...calls.map((call) => `%<tool_call id=\"${call.id}\" name=\"${call.name}\">%`));
+            .all(sessionKey, model, ...calls.map((call) => `<tool_call id="${call.id}" name="${call.name}">`));
           if (candidates.length === 1) row = candidates[0];
           else if (!candidates.length) throw fail(409, "Cannot resume this local tool call because its Gemini replay state is unavailable. Restart the conversation from before the tool call.", "replay_state_missing");
           else throw fail(409, "Cannot resume this local tool call because its Gemini replay state is ambiguous. Restart the conversation from before the tool call.", "replay_state_ambiguous");
@@ -268,9 +261,10 @@ class GeminiClient {
         const body = await response.text();
         if ((response.status !== 429 && response.status < 500) || attempt === 2) throw fail(response.status, `Gemini Interactions request failed: ${body.slice(0, 1000)}`);
         const wait = Math.min(8000, 500 * 2 ** attempt);
-        await new Promise((resolve) => setTimeout(resolve, wait));
+        await sleep(wait, undefined, { signal });
       } catch (error) {
         lastError = error;
+        if (signal?.aborted || error?.name === "AbortError") throw error;
         if (error.status && error.status < 500 && error.status !== 429) throw error;
         if (attempt === 2) throw error;
       }
@@ -288,7 +282,12 @@ async function runWorker(client, call, model, signal) {
   }
   if (call.name === "WebFetch") {
     const url = String(input.url || "");
-    if (!/^https:\/\//i.test(url) || /https:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/i.test(url)) throw fail(400, "URL Context requires a publicly accessible HTTPS URL.", "invalid_request_error");
+    let parsed;
+    try { parsed = new URL(url); } catch { throw fail(400, "URL Context requires a publicly accessible HTTPS URL.", "invalid_request_error"); }
+    const host = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== "https:" || host === "localhost" || host.endsWith(".localhost") || host === "127.0.0.1" || host === "0.0.0.0" || host === "[::1]" || host === "::1") {
+      throw fail(400, "URL Context requires a publicly accessible HTTPS URL.", "invalid_request_error");
+    }
     const response = await client.interaction({ model, input: `${input.prompt || "Read and summarize this URL accurately."}\n\nURL: ${url}`, tools: [{ type: "url_context" }], generation_config: { thinking_level: effortFor(model) }, store: false }, signal);
     return { kind: "fetch", text: responseText(response), citations: citations(response), raw: response };
   }
@@ -326,7 +325,7 @@ async function executeAnthropicRequest({ body, client, replay, signal, sessionKe
     // bridge tool has supplied its result, forcing it again would cause a loop.
     const generation_config = round === 0
       ? generationConfig(body, model, tools)
-      : generationConfig({}, model, tools);
+      : generationConfig({ max_tokens: body.max_tokens }, model, tools);
     latest = await client.interaction({ model, input: dialogue, tools, system_instruction, generation_config, store: false }, signal);
     const calls = functionCalls(latest);
     const bridgeCalls = calls.filter((call) => BRIDGE_TOOLS.has(call.name));
@@ -358,7 +357,9 @@ async function executeAnthropicRequest({ body, client, replay, signal, sessionKe
     const text = responseText(latest);
     if (text) content.push({ type: "text", text });
     for (const call of localCalls) content.push({ type: "tool_use", id: call.id, name: call.name, input: call.input });
-    const response = { id: `msg_${randomUUID().replace(/-/g, "")}`, type: "message", role: "assistant", model: body.model, content: content.length ? content : [{ type: "text", text: "" }], stop_reason: localCalls.length ? "tool_use" : "end_turn", stop_sequence: null, usage: { input_tokens: latest.usage?.total_input_tokens || 0, output_tokens: latest.usage?.total_output_tokens || 0 } };
+    const truncated = latest.status === "incomplete" || latest.status === "budget_exceeded" || latest.finish_reason === "MAX_TOKENS" || (latest.steps || []).some((step) => step.finish_reason === "MAX_TOKENS");
+    const stop_reason = localCalls.length ? "tool_use" : (truncated ? "max_tokens" : "end_turn");
+    const response = { id: `msg_${randomUUID().replace(/-/g, "")}`, type: "message", role: "assistant", model: body.model, content: content.length ? content : [{ type: "text", text: "" }], stop_reason, stop_sequence: null, usage: { input_tokens: latest.usage?.total_input_tokens || 0, output_tokens: latest.usage?.total_output_tokens || 0 } };
     if (!stepsAppended) dialogue.push(...(latest.steps || []));
     replay.saveReplay(sessionKey, body, model, turnText({ role: "assistant", content: response.content }), dialogue);
     return response;
@@ -388,4 +389,4 @@ function sse(response, message) {
   response.end();
 }
 
-module.exports = { MODELS, CLIENT_MODELS, DESKTOP_MODELS, ReplayStore, GeminiClient, executeAnthropicRequest, normalizeModel, effortFor, toolDeclarations, toInteractionInput, generationConfig, sse, fail };
+module.exports = { MODELS, CLIENT_MODELS, DESKTOP_MODELS, ReplayStore, GeminiClient, executeAnthropicRequest, normalizeModel, effortFor, toolDeclarations, generationConfig, sse, fail };

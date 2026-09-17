@@ -4,7 +4,7 @@ Thanks for helping improve Gemini Agent Bridge.
 
 ## Before you start
 
-- Use Node.js 22 or later.
+- Use Node.js 22.5.0 or later.
 - Install no credentials in the repository. API keys belong only in a local CCR provider configuration and must never appear in commits, fixtures, issue reports, or logs.
 - Read the dedicated-gateway limitation in the [README](./README.md) before changing routes: universal `/v1/*` bridge routes cannot coexist with fallthrough to another CCR provider.
 
