@@ -1,118 +1,127 @@
 # Gemini Agent Bridge for CCR
 
-This local CCR extension exposes an Anthropic Messages-compatible endpoint for
-Claude Code and uses Google Gemini's Interactions API behind it. It keeps the
-existing CCR Google provider intact, so the previous configuration remains a
-rollback path.
+Use Claude Code or Claude Desktop with Gemini through a local [Claude Code Router (CCR)](https://github.com/musistudio/claude-code-router) gateway.
 
-## Model policy
+Gemini Agent Bridge is a self-hosted CCR gateway plugin. It accepts Anthropic Messages-compatible requests from Claude clients, translates them to the Gemini Interactions API, and translates the response back. Your prompts travel through your local CCR instance and use the Gemini API access configured there.
 
-| Claude Code role | Gemini model | Thinking |
+It is useful when you want Claude's familiar clients and local-tool workflow while using Gemini as the model provider.
+
+> [!IMPORTANT]
+> You provide and are responsible for your own Gemini API access, quota, and billing. This project does not include an API key, credits, or a billing service. Review [Gemini API billing](https://ai.google.dev/gemini-api/docs/billing) and your account's terms before using it.
+
+## What it does
+
+- Provides an Anthropic Messages-compatible gateway endpoint for Claude Code and Claude Desktop.
+- Maps Claude-facing model choices to three pinned Gemini models with appropriate thinking levels.
+- Bridges Claude's web search, web fetch, and code execution requests to Gemini-native tools.
+- Preserves the native tool history Gemini needs for multi-turn requests, while keeping repository tools and file changes local to Claude Code or Claude Desktop.
+
+## What it does not do
+
+- It does not replace CCR, Claude Code, Claude Desktop, or a Google account with Gemini API access.
+- It does not install a global npm package or change CCR installation files.
+- It does not silently fall back to another model or provider.
+- It cannot enforce Claude web-tool domain allow/block filters with Google grounding; those requests fail clearly instead.
+
+## Requirements
+
+- A running CCR installation with a `Google` provider (or a provider name you choose) containing your Gemini API key.
+- Node.js 22 or later for the plugin and its tests.
+- A dedicated CCR gateway when you enable the bridge's universal `/v1/*` routes.
+- Either Claude Code, Claude Desktop, or both.
+
+Keep your Gemini API key in CCR's existing Google provider configuration. Never add it to this repository, this plugin's configuration, or Claude client settings.
+
+## Install and configure
+
+1. Clone this repository into CCR's plugin directory:
+
+   ```sh
+   git clone https://github.com/<owner>/<repository>.git <CCR_HOME>/plugins/gemini-agent
+   ```
+
+2. Configure CCR's existing Google provider with your Gemini API key. The bridge reads that provider at runtime; no key belongs in the plugin configuration.
+
+3. Copy the plugin and profile structure from [`config.example.json`](./config.example.json) into your CCR configuration. Set the `module` path to this checkout's `entry.cjs` file.
+
+4. For a dedicated Gemini gateway, set `exclusiveGatewayRoutes` to `true`. This registers `/v1/messages`, `/v1/messages/count_tokens`, and `/v1/models` for the bridge.
+
+   Do **not** enable this on a shared gateway. CCR gateway routes cannot inspect a model and then fall through to another provider, so a shared gateway would lose the other provider routes and discovery behavior.
+
+5. Start or restart the dedicated gateway:
+
+   ```sh
+   ccr start --daemon --no-open --gateway
+   ```
+
+6. Select the `gemini-agent` profile in your Claude client and begin a conversation.
+
+### Claude Code
+
+Use the `gemini-agent` CLI profile shown in `config.example.json`. Its default, Sonnet, Opus, and Fable selections resolve to Gemini 3.8 Flash; Haiku and small-fast resolve to Gemini 3.5 Flash-Lite. The bridge exposes `GoogleAgent/claude-gemini-*` aliases because Claude Code requires discoverable model IDs containing `claude`.
+
+### Claude Desktop
+
+Set `desktopProfilePath` to the Claude Desktop profile JSON in the plugin configuration. When the dedicated gateway starts, the bridge updates that profile to use the local CCR gateway, disables generic model discovery, and registers the supported Claude Desktop façade models.
+
+The profile file is rewritten with permissions restricted to its owner. Back it up before the first run if you want an independent rollback point.
+
+## Models
+
+| Claude-facing selection | Gemini model | Thinking level |
 | --- | --- | --- |
-| Default, Sonnet, Opus, Fable | `gemini-3.8-flash` | `high` |
-| Explicit alternative | `gemini-3.1-pro-preview` | `high` |
-| Haiku and small-fast | `gemini-3.5-flash-lite` | `low` |
+| Default, Sonnet, Opus, Fable | `gemini-3.8-flash` | High |
+| Explicit alternative | `gemini-3.1-pro-preview` | High |
+| Haiku, small-fast | `gemini-3.5-flash-lite` | Low |
 
-Claude Code discovery requires client-visible model IDs to contain `claude`, so
-the configured aliases are `GoogleAgent/claude-gemini-*`; the bridge maps them
-only to the pinned Gemini IDs in the table. It does not select a fallback model.
-Main-model requests set `store: false`, use the
-Interactions step-list format, and preserve returned native steps during a
-single request so Gemini receives thought signatures and function-call IDs
-unchanged when a bridge tool returns its result.
+The bridge also recognizes Google `-latest` aliases but resolves them to the pinned models above. This keeps a parent request and any internally bridged tools on the same model.
 
-## Tool bridge
+## Tool behavior
 
-Claude-facing `WebSearch`, `WebFetch`, and `CodeExecution` are normal Gemini
-function declarations. When Gemini calls one, CCR performs a separate worker
-interaction:
+When offered by a Claude client, these tools are handled by Gemini workers:
 
-| Function | Gemini worker tool |
+| Claude-facing tool | Gemini capability |
 | --- | --- |
-| `WebSearch` | `google_search` grounding |
-| `WebFetch` | `url_context` |
-| `CodeExecution` | `code_execution` |
+| `WebSearch` | Google Search grounding |
+| `WebFetch` | URL Context |
+| `CodeExecution` | Hosted code execution |
 
-The worker result is supplied as a native `function_result` step before Gemini
-continues. Workers use the same Gemini model (and thinking level) selected for
-the request, so choosing one of the configured Claude-facing aliases controls
-both the main interaction and these intercepted tools. Other declared tools are
-returned to Claude Code as `tool_use` blocks and remain subject to Claude Code's
-normal local permissions. Domain filters deliberately fail with a clear error
-because Google grounding cannot faithfully enforce Claude's allow/block
-semantics.
+Other declared tools are returned to Claude as normal `tool_use` blocks and continue to follow the client’s existing local permissions. Gemini hosted code execution only receives its task and inline data; it does not receive repository files, builds, package installs, or persistent file access.
 
-### Intercepted-tool model support
+## Data, privacy, and operations
 
-All configured model aliases support every intercepted tool. The bridge passes
-the selected model through to the worker interaction; it does not silently
-switch tool calls to a different model.
+The plugin writes a local replay database under CCR's `app-data/plugins` directory. It stores the native interaction history needed to safely continue stateless requests, including tool-call IDs, thought signatures, tool results, and relevant conversation text. Credentials are not stored there, and logs do not include credentials or full conversation bodies by default.
 
-| Selectable Claude-facing alias | Resolved Gemini model | WebSearch | WebFetch | CodeExecution |
-| --- | --- | --- | --- | --- |
-| `GoogleAgent/claude-gemini-3.8-flash` | `gemini-3.8-flash` | Yes | Yes | Yes |
-| `GoogleAgent/claude-gemini-3.1-pro-preview` | `gemini-3.1-pro-preview` | Yes | Yes | Yes |
-| `GoogleAgent/claude-gemini-3.5-flash-lite` | `gemini-3.5-flash-lite` | Yes | Yes | Yes |
+- `GET /plugins/gemini-agent/health` reports plugin health and configured models.
+- `POST /plugins/gemini-agent/cleanup` deletes replay state unused for 30 days.
+- CCR's ten-minute request timeout still applies. The bridge emits SSE keepalives every 15 seconds and retries transient Google failures up to two times.
 
-Claude Desktop's Sonnet, Opus, and Haiku façade selections resolve to the
-corresponding rows in the model-policy table above and have the same tool
-support.
+## Troubleshooting and rollback
 
-### `-latest` aliases
+- **No Gemini routes are available:** confirm `exclusiveGatewayRoutes: true` is set only on a dedicated gateway, then restart CCR.
+- **Authentication fails:** check the Google provider selected by `googleProviderName` (default: `Google`) in your CCR configuration. Do not put the key in this plugin's config.
+- **A web request with domain filters fails:** this is expected; Google grounding cannot faithfully apply Claude's allow/block domain semantics.
+- **Claude Desktop shows unexpected models:** verify `desktopProfilePath` and restart the dedicated gateway so the profile can be synchronized.
 
-Google describes `-latest` as a moving alias for the newest release of a model
-variation; see its [model version-name guidance](https://ai.google.dev/gemini-api/docs/models#model-version-name-patterns).
-The bridge recognizes these incoming aliases, but resolves them to its pinned
-models so an intercepted tool call stays on the same model as its parent
-request:
+To roll back, stop CCR, disable the `ccr-gemini-agent` plugin or restore your previous CCR configuration, restore the dated Claude Desktop profile backup if applicable, and start CCR again.
 
-| Incoming Google `-latest` alias | Bridge model used for the main interaction and intercepted tools |
-| --- | --- |
-| `gemini-flash-latest` | `gemini-3.8-flash` |
-| `gemini-pro-latest` | `gemini-3.1-pro-preview` |
-| `gemini-flash-lite-latest` | `gemini-3.5-flash-lite` |
+## Development
 
-Hosted code execution only receives its task and inline data. Repository files,
-builds, package installs, and persistent file changes remain local tools.
+```sh
+npm test
+npm run check
+```
 
-## Local state and operations
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development and pull-request guidance. Security issues belong in the private reporting flow described in [SECURITY.md](./SECURITY.md), not public Issues.
 
-The extension writes its replay database below CCR's `app-data/plugins` folder.
-It keeps the native interaction history required for stateless replay, including
-model-generated thought signatures, function-call IDs, tool results, and the
-conversation text needed to re-submit those steps exactly. Credentials are never
-stored there. Operational logs do not capture credentials or full conversation
-bodies by default. The `POST
-/plugins/gemini-agent/cleanup` endpoint deletes state unused for 30 days. CCR's
-existing ten-minute request timeout remains in force. The bridge sends SSE
-keepalives every 15 seconds and retries transient Google failures at most twice.
+## Support
 
-Use `config.example.json` as a sanitized reference. The Google API key remains
-only in CCR's existing `Google` provider configuration; never add it to Claude
-Code settings or this extension's configuration.
+If this project is useful to you, optional support is welcome at [Buy Me a Coffee](https://buymeacoffee.com/karsonm).
 
-## Gateway scope
+## Project status
 
-CCR gateway routes cannot inspect a model and then fall through to another
-provider. Consequently, this bridge only claims the universal `/v1/*` endpoints
-when `exclusiveGatewayRoutes: true` is set. Enable that setting only for a
-dedicated Gemini gateway; on a shared CCR gateway it stays disabled, preserving
-the routes and model discovery of every other provider. Desktop profile
-synchronization is likewise performed only in that dedicated mode.
+Gemini Agent Bridge is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic, Google, Claude Code Router, or their respective organizations.
 
-For Claude Desktop, set `desktopProfilePath` in the plugin configuration to the
-Desktop profile JSON. CCR's generic model discovery precedes extension routes,
-so the bridge synchronizes its three explicit Gemini façade routes on CCR
-startup instead of allowing generic discovery to replace them.
+## License
 
-## Rollback
-
-1. Stop CCR: `ccr stop`.
-2. Restore the CCR configuration database from its backup using SQLite's
-   `.backup` mechanism, or disable the `ccr-gemini-agent` plugin and select
-   the prior `Google/...` profile.
-3. Restore `~/.claude/settings.json` from its dated backup.
-4. Start CCR with `ccr start --daemon --no-open --gateway`.
-
-The extension source is self-contained in this directory; no global npm package
-or CCR installation files are changed.
+This project is licensed under the [GNU General Public License v3.0 only](./LICENSE).
