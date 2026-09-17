@@ -11,6 +11,7 @@ test("maps pinned models and rejects unknown models", () => {
   assert.equal(normalizeModel("GoogleAgent/gemini-3.8-flash"), "gemini-3.8-flash");
   assert.equal(normalizeModel("GoogleAgent/claude-gemini-3.8-flash"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-sonnet-4-5"), "gemini-3.8-flash");
+  assert.equal(normalizeModel("anthropic/claude-haiku"), "gemini-3.5-flash-lite");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d666c6173682d6c6174657374"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d70726f2d6c6174657374"), "gemini-3.1-pro-preview");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d666c6173682d6c6974652d6c6174657374"), "gemini-3.5-flash-lite");
@@ -72,6 +73,38 @@ test("restores local-tool replay by exact tool ID when Desktop changes its syste
   }]);
 });
 
+test("matches replayed tool results against Gemini call_id and retains accompanying user text", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const first = { messages: [{ role: "user", content: "Read the file" }] };
+  const assistantText = '<tool_call id="call-id-only" name="Read">{}</tool_call>';
+  const history = [
+    { type: "user_input", content: [{ type: "text", text: "Read the file" }] },
+    { type: "function_call", call_id: "call-id-only", name: "Read", arguments: {} }
+  ];
+  replay.saveReplay("session-call-id", first, "gemini-3.8-flash", assistantText, history);
+  const restored = replay.restoreForRequest("session-call-id", {
+    messages: [
+      ...first.messages,
+      { role: "assistant", content: [{ type: "tool_use", id: "call-id-only", name: "Read", input: {} }] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "call-id-only", content: "file contents" },
+        { type: "text", text: "Now summarize it in one sentence." }
+      ] }
+    ]
+  }, "gemini-3.8-flash");
+  assert.deepEqual(restored.slice(-2), [
+    { type: "function_result", name: "Read", call_id: "call-id-only", result: [{ type: "text", text: "file contents" }] },
+    { type: "user_input", content: [{ type: "text", text: "Now summarize it in one sentence." }] }
+  ]);
+});
+
+test("uses WAL and a busy timeout without creating the obsolete turns table", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  assert.equal(replay.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+  assert.equal(replay.db.prepare("PRAGMA busy_timeout").get().timeout, 5000);
+  assert.equal(replay.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turns'").get(), undefined);
+});
+
 test("does not serialize unrecoverable local tool calls into model text", () => {
   const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
   assert.throws(() => replay.restoreForRequest("desktop-session", {
@@ -97,6 +130,17 @@ test("streams local tool arguments as Anthropic input_json_delta events", () => 
   assert.deepEqual(JSON.parse(delta.delta.partial_json), { command: "ls -la", description: "List files" });
 });
 
+test("streams final output token usage", () => {
+  let output = "";
+  sse({ write: (chunk) => { output += chunk; }, end: () => {} }, {
+    id: "msg_usage", model: "anthropic/claude-sonnet-4-5", usage: { input_tokens: 2, output_tokens: 17 }, stop_reason: "end_turn",
+    content: [{ type: "text", text: "Done" }]
+  });
+  const messageDelta = output.split("\n").filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6))).find((event) => event.type === "message_delta");
+  assert.equal(messageDelta.usage.output_tokens, 17);
+});
+
 test("executes a native search internally and returns a final Claude message", async () => {
   const calls = [];
   const responses = [
@@ -118,4 +162,71 @@ test("executes a native search internally and returns a final Claude message", a
   assert.equal(calls[2].input.some((step) => step.type === "function_call"), true);
   assert.deepEqual(calls[1].tools, [{ type: "google_search" }]);
   assert.equal(calls.every((call) => call.store === false), true);
+});
+
+test("uses the request's selected model for intercepted tools", async () => {
+  const calls = [];
+  const responses = [
+    { output_text: "", steps: [{ type: "function_call", id: "search-1", name: "WebSearch", arguments: { query: "Gemini API" } }] },
+    { output_text: "Grounded answer", steps: [{ type: "model_output", content: [{ type: "text", text: "Grounded answer" }] }] },
+    { output_text: "Final answer", steps: [{ type: "model_output", content: [{ type: "text", text: "Final answer" }] }] }
+  ];
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async (_url, options) => {
+    calls.push(JSON.parse(options.body));
+    return new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } });
+  } });
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
+  await executeAnthropicRequest({ body: { model: "GoogleAgent/gemini-3.5-flash-lite", messages: [{ role: "user", content: "Research Gemini API" }], tools: [{ type: "web_search_20250305" }] }, client, replay });
+  assert.equal(calls[0].model, "gemini-3.5-flash-lite");
+  assert.equal(calls[1].model, "gemini-3.5-flash-lite");
+  assert.equal(calls[1].generation_config.thinking_level, "low");
+});
+
+test("does not duplicate native steps when bridge and local tools are returned together", async () => {
+  const responses = [
+    { output_text: "", steps: [
+      { type: "function_call", id: "search-1", name: "WebSearch", arguments: { query: "Gemini API" } },
+      { type: "function_call", id: "bash-1", name: "Bash", arguments: { command: "pwd" } }
+    ] },
+    { output_text: "search result", steps: [{ type: "model_output", content: [{ type: "text", text: "search result" }] }] }
+  ];
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async () => new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } }) });
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
+  const body = { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Search, then run pwd" }], tools: [{ type: "web_search_20250305" }, { name: "Bash", input_schema: { type: "object" } }] };
+  const message = await executeAnthropicRequest({ body, client, replay });
+  assert.equal(message.stop_reason, "tool_use");
+  const stored = replay.db.prepare("SELECT history_json FROM replays").get();
+  const history = JSON.parse(stored.history_json);
+  assert.equal(history.filter((step) => step.type === "function_call" && step.id === "search-1").length, 1);
+  assert.equal(history.filter((step) => step.type === "function_call" && step.id === "bash-1").length, 1);
+});
+
+test("returns bridge worker failures to Gemini as function results", async () => {
+  const requests = [];
+  const responses = [
+    { output_text: "", steps: [{ type: "function_call", id: "fetch-1", name: "WebFetch", arguments: { url: "http://example.com" } }] },
+    { output_text: "I need an HTTPS URL.", steps: [{ type: "model_output", content: [{ type: "text", text: "I need an HTTPS URL." }] }] }
+  ];
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } });
+  } });
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
+  const message = await executeAnthropicRequest({ body: { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Fetch this" }], tools: [{ type: "web_fetch_20250910" }] }, client, replay });
+  assert.equal(message.content.at(-1).text, "I need an HTTPS URL.");
+  const result = requests[1].input.find((step) => step.type === "function_result");
+  assert.match(result.result[0].text, /^Error: URL Context requires/);
+});
+
+test("propagates bridge worker cancellation instead of turning it into a tool result", async () => {
+  let requestCount = 0;
+  const aborted = new Error("request cancelled");
+  aborted.name = "AbortError";
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async () => {
+    requestCount += 1;
+    if (requestCount === 1) return new Response(JSON.stringify({ output_text: "", steps: [{ type: "function_call", id: "fetch-1", name: "WebFetch", arguments: { url: "https://example.com" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+    throw aborted;
+  } });
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
+  await assert.rejects(() => executeAnthropicRequest({ body: { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Fetch this" }], tools: [{ type: "web_fetch_20250910" }] }, client, replay }), aborted);
 });

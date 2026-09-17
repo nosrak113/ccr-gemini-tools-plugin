@@ -53,6 +53,7 @@ function normalizeModel(model) {
   if (clean === "sonnet-4-5") return MODELS.primary;
   if (clean === "opus-4-5") return MODELS.preview;
   if (clean === "haiku-4-5") return MODELS.helper;
+  if (clean === "haiku") return MODELS.helper;
   if (!clean || clean === "default" || clean === "sonnet" || clean === "opus") return MODELS.primary;
   if ([MODELS.primary, MODELS.preview, MODELS.helper].includes(clean)) return clean;
   throw fail(400, `Unsupported GoogleAgent model: ${model}`, "invalid_request_error");
@@ -180,17 +181,12 @@ function citations(interaction) {
 class ReplayStore {
   constructor(directory) {
     this.db = new DatabaseSync(join(directory, "gemini-agent-replay.sqlite"));
-    this.db.exec("CREATE TABLE IF NOT EXISTS turns (id TEXT PRIMARY KEY, session_key TEXT NOT NULL, request_hash TEXT NOT NULL, model TEXT NOT NULL, response_json TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL)");
+    // Concurrent gateway requests may share this replay database. WAL lets readers
+    // proceed while a replay is written, and the timeout avoids transient BUSY
+    // failures when two tool turns finish together.
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.db.exec("CREATE TABLE IF NOT EXISTS replays (id TEXT PRIMARY KEY, session_key TEXT NOT NULL, model TEXT NOT NULL, prefix_hash TEXT NOT NULL, assistant_text TEXT NOT NULL, history_json TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS turns_expiry ON turns(last_used_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS replays_lookup ON replays(session_key, model, prefix_hash, last_used_at DESC)");
-  }
-  save(sessionKey, request, model, response) {
-    const now = Date.now();
-    const id = randomUUID();
-    const requestHash = createHash("sha256").update(JSON.stringify(request)).digest("hex");
-    this.db.prepare("INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, sessionKey, requestHash, model, JSON.stringify(response), now, now);
-    return id;
   }
   prefixHash(body, beforeIndex) {
     return createHash("sha256").update(JSON.stringify({ system: body.system || "", messages: (body.messages || []).slice(0, beforeIndex) })).digest("hex");
@@ -232,10 +228,16 @@ class ReplayStore {
       const toolResults = Array.isArray(message.content) ? message.content.filter((part) => part?.type === "tool_result") : [];
       if (toolResults.length) {
         for (const result of toolResults) {
-          const call = [...dialogue].reverse().find((step) => step.type === "function_call" && step.id === result.tool_use_id);
-          if (call) dialogue.push(functionResult({ id: call.id, name: call.name }, textOf(result.content)));
+          const call = [...dialogue].reverse().find((step) => step.type === "function_call" && (step.id === result.tool_use_id || step.call_id === result.tool_use_id));
+          if (call) dialogue.push(functionResult({ id: call.id || call.call_id, name: call.name }, textOf(result.content)));
           else dialogue.push({ type: "user_input", content: [{ type: "text", text: turnText(message) }] });
         }
+        const accompanyingText = message.content
+          .filter((part) => part && (part.type === "text" || part.type === "input_text"))
+          .map((part) => part.text || "")
+          .filter(Boolean)
+          .join("\n");
+        if (accompanyingText) dialogue.push({ type: "user_input", content: [{ type: "text", text: accompanyingText }] });
         continue;
       }
       const text = turnText(message);
@@ -245,9 +247,8 @@ class ReplayStore {
   }
   cleanup(days = 30) {
     const cutoff = Date.now() - days * 86400000;
-    const turns = this.db.prepare("DELETE FROM turns WHERE last_used_at < ?").run(cutoff).changes;
     const replays = this.db.prepare("DELETE FROM replays WHERE last_used_at < ?").run(cutoff).changes;
-    return turns + replays;
+    return replays;
   }
 }
 
@@ -278,21 +279,21 @@ class GeminiClient {
   }
 }
 
-async function runWorker(client, call, signal) {
+async function runWorker(client, call, model, signal) {
   const input = call.input || {};
   if (call.name === "WebSearch") {
     if ((input.allowed_domains && input.allowed_domains.length) || (input.blocked_domains && input.blocked_domains.length)) throw fail(400, "Google Search grounding cannot faithfully enforce Claude domain filters.", "invalid_request_error");
-    const response = await client.interaction({ model: MODELS.primary, input: String(input.query || ""), tools: [{ type: "google_search" }], generation_config: { thinking_level: "high" }, store: false }, signal);
+    const response = await client.interaction({ model, input: String(input.query || ""), tools: [{ type: "google_search" }], generation_config: { thinking_level: effortFor(model) }, store: false }, signal);
     return { kind: "search", text: responseText(response), citations: citations(response), raw: response };
   }
   if (call.name === "WebFetch") {
     const url = String(input.url || "");
     if (!/^https:\/\//i.test(url) || /https:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/i.test(url)) throw fail(400, "URL Context requires a publicly accessible HTTPS URL.", "invalid_request_error");
-    const response = await client.interaction({ model: MODELS.primary, input: `${input.prompt || "Read and summarize this URL accurately."}\n\nURL: ${url}`, tools: [{ type: "url_context" }], generation_config: { thinking_level: "high" }, store: false }, signal);
+    const response = await client.interaction({ model, input: `${input.prompt || "Read and summarize this URL accurately."}\n\nURL: ${url}`, tools: [{ type: "url_context" }], generation_config: { thinking_level: effortFor(model) }, store: false }, signal);
     return { kind: "fetch", text: responseText(response), citations: citations(response), raw: response };
   }
   if (call.name === "CodeExecution") {
-    const response = await client.interaction({ model: MODELS.primary, input: `${input.task}\n\nInline data: ${JSON.stringify(input.data ?? null)}`, tools: [{ type: "code_execution" }], generation_config: { thinking_level: "high" }, store: false }, signal);
+    const response = await client.interaction({ model, input: `${input.task}\n\nInline data: ${JSON.stringify(input.data ?? null)}`, tools: [{ type: "code_execution" }], generation_config: { thinking_level: effortFor(model) }, store: false }, signal);
     const evidence = (response.steps || []).filter((step) => step.type === "code_execution_result" || step.type === "executable_code");
     if (!evidence.length) throw fail(502, "Gemini returned no hosted code-execution evidence.", "tool_error");
     return { kind: "code", text: responseText(response), citations: [], raw: response };
@@ -330,14 +331,26 @@ async function executeAnthropicRequest({ body, client, replay, signal, sessionKe
     const calls = functionCalls(latest);
     const bridgeCalls = calls.filter((call) => BRIDGE_TOOLS.has(call.name));
     const localCalls = calls.filter((call) => !BRIDGE_TOOLS.has(call.name));
+    let stepsAppended = false;
     if (bridgeCalls.length) {
       // Stateless Interactions requires the exact returned steps, including thought
       // signatures and function-call IDs, before any function result is appended.
       dialogue.push(...(latest.steps || []));
+      stepsAppended = true;
       for (const call of bridgeCalls) {
-        const worker = await runWorker(client, call, signal);
-        visible.push(...serverBlocks(worker, call));
-        dialogue.push(functionResult(call, worker.text));
+        try {
+          const worker = await runWorker(client, call, model, signal);
+          visible.push(...serverBlocks(worker, call));
+          dialogue.push(functionResult(call, worker.text));
+        } catch (error) {
+          // Cancellation and upstream transport failures belong to the request,
+          // rather than to the model's tool invocation. Surface those normally.
+          if (signal?.aborted || error?.name === "AbortError" || !["invalid_request_error", "tool_error"].includes(error?.type)) throw error;
+          // A model-generated bridge call can be invalid (for example, a non-HTTPS
+          // URL). Feed the failure back to Gemini so it can correct itself instead
+          // of failing the entire Anthropic request.
+          dialogue.push(functionResult(call, `Error: ${error.message || "Bridge tool failed."}`));
+        }
       }
       if (!localCalls.length) continue;
     }
@@ -346,8 +359,7 @@ async function executeAnthropicRequest({ body, client, replay, signal, sessionKe
     if (text) content.push({ type: "text", text });
     for (const call of localCalls) content.push({ type: "tool_use", id: call.id, name: call.name, input: call.input });
     const response = { id: `msg_${randomUUID().replace(/-/g, "")}`, type: "message", role: "assistant", model: body.model, content: content.length ? content : [{ type: "text", text: "" }], stop_reason: localCalls.length ? "tool_use" : "end_turn", stop_sequence: null, usage: { input_tokens: latest.usage?.total_input_tokens || 0, output_tokens: latest.usage?.total_output_tokens || 0 } };
-    dialogue.push(...(latest.steps || []));
-    replay.save(sessionKey, body, model, latest);
+    if (!stepsAppended) dialogue.push(...(latest.steps || []));
     replay.saveReplay(sessionKey, body, model, turnText({ role: "assistant", content: response.content }), dialogue);
     return response;
   }
@@ -371,7 +383,7 @@ function sse(response, message) {
     if (block.type === "tool_use") response.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input || {}) } })}\n\n`);
     response.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index })}\n\n`);
   });
-  response.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage: { output_tokens: 0 } })}\n\n`);
+  response.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage: { output_tokens: message.usage?.output_tokens || 0 } })}\n\n`);
   response.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
   response.end();
 }

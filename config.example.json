@@ -15,6 +15,7 @@
       ],
       "config": {
         "googleProviderName": "Google",
+        "exclusiveGatewayRoutes": true,
         "desktopProfilePath": "<DESKTOP_PROFILE_PATH>"
       }
     }

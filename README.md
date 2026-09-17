@@ -34,10 +34,43 @@ interaction:
 | `CodeExecution` | `code_execution` |
 
 The worker result is supplied as a native `function_result` step before Gemini
-continues. Other declared tools are returned to Claude Code as `tool_use`
-blocks and remain subject to Claude Code's normal local permissions. Domain
-filters deliberately fail with a clear error because Google grounding cannot
-faithfully enforce Claude's allow/block semantics.
+continues. Workers use the same Gemini model (and thinking level) selected for
+the request, so choosing one of the configured Claude-facing aliases controls
+both the main interaction and these intercepted tools. Other declared tools are
+returned to Claude Code as `tool_use` blocks and remain subject to Claude Code's
+normal local permissions. Domain filters deliberately fail with a clear error
+because Google grounding cannot faithfully enforce Claude's allow/block
+semantics.
+
+### Intercepted-tool model support
+
+All configured model aliases support every intercepted tool. The bridge passes
+the selected model through to the worker interaction; it does not silently
+switch tool calls to a different model.
+
+| Selectable Claude-facing alias | Resolved Gemini model | WebSearch | WebFetch | CodeExecution |
+| --- | --- | --- | --- | --- |
+| `GoogleAgent/claude-gemini-3.8-flash` | `gemini-3.8-flash` | Yes | Yes | Yes |
+| `GoogleAgent/claude-gemini-3.1-pro-preview` | `gemini-3.1-pro-preview` | Yes | Yes | Yes |
+| `GoogleAgent/claude-gemini-3.5-flash-lite` | `gemini-3.5-flash-lite` | Yes | Yes | Yes |
+
+Claude Desktop's Sonnet, Opus, and Haiku façade selections resolve to the
+corresponding rows in the model-policy table above and have the same tool
+support.
+
+### `-latest` aliases
+
+Google describes `-latest` as a moving alias for the newest release of a model
+variation; see its [model version-name guidance](https://ai.google.dev/gemini-api/docs/models#model-version-name-patterns).
+The bridge recognizes these incoming aliases, but resolves them to its pinned
+models so an intercepted tool call stays on the same model as its parent
+request:
+
+| Incoming Google `-latest` alias | Bridge model used for the main interaction and intercepted tools |
+| --- | --- |
+| `gemini-flash-latest` | `gemini-3.8-flash` |
+| `gemini-pro-latest` | `gemini-3.1-pro-preview` |
+| `gemini-flash-lite-latest` | `gemini-3.5-flash-lite` |
 
 Hosted code execution only receives its task and inline data. Repository files,
 builds, package installs, and persistent file changes remain local tools.
@@ -57,6 +90,15 @@ keepalives every 15 seconds and retries transient Google failures at most twice.
 Use `config.example.json` as a sanitized reference. The Google API key remains
 only in CCR's existing `Google` provider configuration; never add it to Claude
 Code settings or this extension's configuration.
+
+## Gateway scope
+
+CCR gateway routes cannot inspect a model and then fall through to another
+provider. Consequently, this bridge only claims the universal `/v1/*` endpoints
+when `exclusiveGatewayRoutes: true` is set. Enable that setting only for a
+dedicated Gemini gateway; on a shared CCR gateway it stays disabled, preserving
+the routes and model discovery of every other provider. Desktop profile
+synchronization is likewise performed only in that dedicated mode.
 
 For Claude Desktop, set `desktopProfilePath` in the plugin configuration to the
 Desktop profile JSON. CCR's generic model discovery precedes extension routes,
