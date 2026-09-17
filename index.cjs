@@ -5,7 +5,7 @@ const { randomUUID } = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { join, resolve } = require("node:path");
 const { homedir } = require("node:os");
-const { GeminiClient, ReplayStore, executeAnthropicRequest, normalizeModel, MODELS, CLIENT_MODELS, DESKTOP_MODELS, sse } = require("./lib.cjs");
+const { GeminiClient, ReplayStore, executeAnthropicRequest, normalizeModel, effortFor, MODELS, CLIENT_MODELS, DESKTOP_MODELS, sse } = require("./lib.cjs");
 
 let requestLogDb = null;
 
@@ -80,7 +80,7 @@ function recordCcrRequest(details, logger) {
         details.status, details.status < 400 ? 1 : 0, Date.now() - details.startedAt,
         usage.input_tokens || 0, usage.output_tokens || 0, 0, 0,
         (usage.input_tokens || 0) + (usage.output_tokens || 0),
-        JSON.stringify({ configured_effort: details.resolvedModel === MODELS.helper ? "low" : "high" }),
+        JSON.stringify({ configured_effort: effortFor(details.resolvedModel) }),
         JSON.stringify({ native_tool_invocations: toolNames }), details.error || ""
       );
   } catch (error) {
@@ -96,9 +96,8 @@ function countRequestTokens(body) {
 }
 
 function sendSseError(response, error) {
-  if (!response.writableEnded) {
+  if (!response.writableEnded && !response.destroyed) {
     response.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: error.type || "api_error", message: error.message || "GoogleAgent failed" } })}\n\n`);
-    response.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
     response.end();
   }
 }
@@ -139,27 +138,35 @@ module.exports = {
       try {
         body = await helpers.readJson(request);
         try { resolvedModel = normalizeModel(body.model); } catch {
-          const error = { error: { type: "not_found_error", message: "This route is reserved for configured Gemini aliases." } };
+          const error = { type: "error", error: { type: "not_found_error", message: "This route is reserved for configured Gemini aliases." } };
           recordCcrRequest({ requestId, startedAt, client: String(request.headers["user-agent"] || "claude-client"), requestedModel: body.model || "", resolvedModel, stream: !!body.stream, status: 404, error: error.error.message }, ctx.logger);
           return send(response, helpers, 404, error);
         }
         const controller = new AbortController();
+        let heartbeat;
         // IncomingMessage emits "close" after a normal request body completes,
         // so using it here would abort slow native-tool work. "aborted" signals
         // a real client cancellation; the response close handler covers a client
         // disconnect that occurs while the response is still pending.
         request.on("aborted", () => controller.abort());
-        response.on("close", () => { if (!response.writableEnded) controller.abort(); });
+        response.on("close", () => {
+          if (heartbeat) clearInterval(heartbeat);
+          if (!response.writableEnded) controller.abort();
+        });
         const sessionKey = request.headers["x-claude-code-session-id"] || body.metadata?.user_id;
         const pending = executeAnthropicRequest({ body, client: buildClient(), replay, signal: controller.signal, sessionKey });
         if (body.stream) {
           response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-          const heartbeat = setInterval(() => response.write(": ping\n\n"), 15000);
+          heartbeat = setInterval(() => {
+            if (!response.destroyed && !response.writableEnded) response.write(": ping\n\n");
+          }, 15000);
           try {
             const message = await pending;
             recordCcrRequest({ requestId, startedAt, client: String(request.headers["user-agent"] || "claude-client"), requestedModel: body.model, resolvedModel, stream: true, status: 200, response: message }, ctx.logger);
             sse(response, message);
-          } finally { clearInterval(heartbeat); }
+          } finally {
+            if (heartbeat) clearInterval(heartbeat);
+          }
           return;
         }
         const message = await pending;

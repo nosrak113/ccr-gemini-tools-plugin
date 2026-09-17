@@ -12,6 +12,8 @@ test("maps pinned models and rejects unknown models", () => {
   assert.equal(normalizeModel("GoogleAgent/claude-gemini-3.8-flash"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-sonnet-4-5"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-haiku"), "gemini-3.5-flash-lite");
+  assert.equal(normalizeModel("GoogleAgent/claude-fable"), "gemini-3.8-flash");
+  assert.equal(normalizeModel("fable"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d666c6173682d6c6174657374"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d70726f2d6c6174657374"), "gemini-3.1-pro-preview");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d666c6173682d6c6974652d6c6174657374"), "gemini-3.5-flash-lite");
@@ -229,4 +231,45 @@ test("propagates bridge worker cancellation instead of turning it into a tool re
   } });
   const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
   await assert.rejects(() => executeAnthropicRequest({ body: { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Fetch this" }], tools: [{ type: "web_fetch_20250910" }] }, client, replay }), aborted);
+});
+
+test("preserves max_tokens across multi-round tool loops", () => {
+  const config = generationConfig({ max_tokens: 500 }, "gemini-3.8-flash", []);
+  assert.equal(config.max_output_tokens, 500);
+});
+
+test("GeminiClient aborts immediately on AbortError without retry", async () => {
+  let attempts = 0;
+  const aborted = new Error("aborted");
+  aborted.name = "AbortError";
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async () => {
+    attempts += 1;
+    throw aborted;
+  } });
+  await assert.rejects(() => client.interaction({}), aborted);
+  assert.equal(attempts, 1);
+});
+
+test("sets stop_reason to max_tokens when generation is truncated", async () => {
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async () => new Response(JSON.stringify({
+    output_text: "Truncated text", status: "budget_exceeded", steps: [{ type: "model_output", content: [{ type: "text", text: "Truncated text" }] }]
+  }), { status: 200, headers: { "content-type": "application/json" } }) });
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
+  const message = await executeAnthropicRequest({ body: { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Write a long essay" }] }, client, replay });
+  assert.equal(message.stop_reason, "max_tokens");
+});
+
+test("assigns generated UUID back to function_call step in latest.steps", async () => {
+  const step = { type: "function_call", name: "Bash", arguments: { command: "ls" } };
+  const client = new GeminiClient({ apiKey: "test", fetchImpl: async () => new Response(JSON.stringify({
+    output_text: "", steps: [step]
+  }), { status: 200, headers: { "content-type": "application/json" } }) });
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-test-")));
+  const message = await executeAnthropicRequest({ body: { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Run ls" }], tools: [{ name: "Bash", input_schema: { type: "object" } }] }, client, replay });
+  assert.equal(message.stop_reason, "tool_use");
+  const stored = replay.db.prepare("SELECT history_json FROM replays").get();
+  const history = JSON.parse(stored.history_json);
+  const storedStep = history.find((s) => s.type === "function_call" && s.name === "Bash");
+  assert.equal(typeof storedStep.id, "string");
+  assert.equal(message.content[0].id, storedStep.id);
 });
