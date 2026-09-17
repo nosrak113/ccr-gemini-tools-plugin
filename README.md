@@ -88,6 +88,16 @@ When offered by a Claude client, these tools are handled by Gemini workers:
 
 Other declared tools are returned to Claude as normal `tool_use` blocks and continue to follow the client’s existing local permissions. Gemini hosted code execution only receives its task and inline data; it does not receive repository files, builds, package installs, or persistent file access.
 
+### Benefits of native tools vs. MCP servers
+
+Instead of configuring external Model Context Protocol (MCP) servers to replicate search, fetching, code execution, or local developer operations, this plugin maps Claude's native tools directly to first-party capabilities:
+
+- **`WebSearch` via Google Search grounding:** Connects Claude's search requests directly to Google's live search index and citation engine. You get first-party search grounding without installing search MCP servers (such as Brave or Tavily) or managing extra API keys.
+- **`WebFetch` via Gemini URL Context:** Fetches and extracts public web content server-side. Eliminates the need for local browser-automation MCP servers (such as Puppeteer or Playwright) that require local headless browser dependencies and consume CPU and memory.
+- **`CodeExecution` in hosted sandboxes:** Runs Python calculations and data-processing tasks in Google's secure cloud environment, avoiding the need for local code-runner MCP servers or container sandboxes for scratch math and evaluation.
+- **Local repository tools (`Read`, `Edit`, `Write`, `Bash`):** Passed back to Claude Code or Claude Desktop as standard client tool calls. This preserves native interactive diffs, syntax highlighting, fine-grained permission prompts, and sandbox boundaries that generic filesystem or terminal MCP servers lose.
+- **Lower overhead and token savings:** Avoids MCP schema boilerplate, namespace prefixes (`mcp__*`), and JSON-RPC process hops, keeping prompt token usage lean and multi-turn tool loops fast.
+
 ## Data, privacy, and operations
 
 The plugin writes a local replay database under CCR's `app-data/plugins` directory. It stores the native interaction history needed to safely continue stateless requests, including tool-call IDs, thought signatures, tool results, and relevant conversation text. Credentials are not stored there, and logs do not include credentials or full conversation bodies by default.
