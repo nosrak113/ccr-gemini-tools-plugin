@@ -65,7 +65,7 @@ test("health reports the replay-correlation patch version", async () => {
   const route = fixture.routes.find((candidate) => candidate.path === "/plugins/gemini-agent/health");
   const result = await route.handler({}, {}, jsonHelpers({}));
   assert.equal(result.status, 200);
-  assert.equal(result.value.version, "0.2.2");
+  assert.equal(result.value.version, "0.2.4");
   bridge.stop();
 });
 

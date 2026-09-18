@@ -110,7 +110,7 @@ module.exports = {
     const replay = new ReplayStore(ctx.paths.pluginDataDir, ctx.logger);
     const buildClient = () => new GeminiClient({ apiKey: googleKey(ctx.config, config.googleProviderName || "Google"), baseUrl: config.interactionsBaseUrl });
     const send = (response, helpers, status, body) => helpers.sendJson(response, status, body);
-    ctx.registerGatewayRoute({ key: "gemini-agent-health", method: "GET", path: "/plugins/gemini-agent/health", auth: "gateway", handler: async (_request, response, helpers) => send(response, helpers, 200, { ok: true, version: "0.2.2", models: MODELS }) });
+    ctx.registerGatewayRoute({ key: "gemini-agent-health", method: "GET", path: "/plugins/gemini-agent/health", auth: "gateway", handler: async (_request, response, helpers) => send(response, helpers, 200, { ok: true, version: "0.2.4", models: MODELS }) });
     ctx.registerGatewayRoute({ key: "gemini-agent-cleanup", method: "POST", path: "/plugins/gemini-agent/cleanup", auth: "gateway", handler: async (_request, response, helpers) => send(response, helpers, 200, { deleted: replay.cleanup(30) }) });
     // CCR's gateway route API matches only method/path and has no handler
     // fallthrough. Do not register universal endpoints unless this CCR instance

@@ -22,6 +22,12 @@ const DESKTOP_MODELS = Object.freeze({
 });
 const BRIDGE_TOOLS = new Set(["WebSearch", "WebFetch", "CodeExecution"]);
 const MAX_TOOL_ROUNDS = 12;
+// Claude Desktop may materialize these defaults in its persisted transcript even
+// when the streamed Gemini function call omitted them. Retries do not always
+// include the original tool schemas, so preserve the same semantics there.
+const CLAUDE_DESKTOP_TOOL_DEFAULTS = Object.freeze({
+  Edit: Object.freeze({ replace_all: Object.freeze({ default: false }) })
+});
 
 function fail(status, message, type = "api_error") {
   const error = new Error(message);
@@ -112,11 +118,32 @@ function hash(value) {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
-function localCallIdentity(calls) {
+function normalizeInputWithSchema(value, schema) {
+  if (Array.isArray(value)) return value.map((item) => normalizeInputWithSchema(item, schema?.items));
+  if (!value || typeof value !== "object") return value;
+  const properties = schema?.properties || {};
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, item]) => !Object.hasOwn(properties, key) || !Object.hasOwn(properties[key] || {}, "default") || canonicalJson(item) !== canonicalJson(properties[key].default))
+    .map(([key, item]) => [key, normalizeInputWithSchema(item, properties[key])]));
+}
+
+function toolSchemas(tools) {
+  return new Map((tools || [])
+    .filter((tool) => tool?.name && tool.input_schema)
+    .map((tool) => [tool.name, tool.input_schema]));
+}
+
+function schemaForTool(schemas, name) {
+  const schema = schemas.get(name) || {};
+  const defaults = CLAUDE_DESKTOP_TOOL_DEFAULTS[name] || {};
+  return { ...schema, properties: { ...defaults, ...(schema.properties || {}) } };
+}
+
+function localCallIdentity(calls, schemas = new Map()) {
   return (calls || []).map((call) => ({
     id: String(call.id || ""),
     name: String(call.name || ""),
-    input: call.input ?? {}
+    input: normalizeInputWithSchema(call.input ?? {}, schemaForTool(schemas, call.name))
   }));
 }
 
@@ -222,23 +249,23 @@ class ReplayStore {
   messagePrefixHash(body, beforeIndex) {
     return hash({ messages: (body.messages || []).slice(0, beforeIndex) });
   }
-  toolFingerprint(calls) {
-    return hash(localCallIdentity(calls));
+  toolFingerprint(calls, schemas) {
+    return hash(localCallIdentity(calls, schemas));
   }
   saveReplay(sessionKey, body, model, assistantText, history, calls = []) {
     const now = Date.now();
     this.db.prepare("INSERT INTO replays (id, session_key, model, prefix_hash, assistant_text, history_json, created_at, last_used_at, message_prefix_hash, tool_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(randomUUID(), sessionKey, model, this.prefixHash(body, (body.messages || []).length), assistantText, JSON.stringify(history), now, now, this.messagePrefixHash(body, (body.messages || []).length), this.toolFingerprint(calls));
+      .run(randomUUID(), sessionKey, model, this.prefixHash(body, (body.messages || []).length), assistantText, JSON.stringify(history), now, now, this.messagePrefixHash(body, (body.messages || []).length), this.toolFingerprint(calls, toolSchemas(body.tools)));
   }
   matchingRows(query, parameters) {
     return this.db.prepare(query).all(...parameters);
   }
-  matchingToolHistory(rows, calls) {
-    const expected = localCallIdentity(calls).map(canonicalJson);
+  matchingToolHistory(rows, calls, schemas) {
+    const expected = localCallIdentity(calls, schemas).map(canonicalJson);
     return rows.filter((row) => {
       let history;
       try { history = JSON.parse(row.history_json); } catch { return false; }
-      const available = history.filter((step) => step?.type === "function_call").map(functionCallIdentity).map(canonicalJson);
+      const available = history.filter((step) => step?.type === "function_call").map(functionCallIdentity).map((call) => ({ ...call, input: normalizeInputWithSchema(call.input, schemaForTool(schemas, call.name)) })).map(canonicalJson);
       let from = 0;
       for (const call of expected) {
         const found = available.indexOf(call, from);
@@ -256,6 +283,7 @@ class ReplayStore {
   }
   restoreForRequest(sessionKey, body, model) {
     const messages = body.messages || [];
+    const schemas = toolSchemas(body.tools);
     const dialogue = [];
     for (let index = 0; index < messages.length; index += 1) {
       const message = messages[index] || {};
@@ -266,7 +294,7 @@ class ReplayStore {
         const calls = toolUses(message);
         if (!row && calls.length) {
           const stableRows = this.matchingRows(`${select} AND message_prefix_hash = ? AND tool_fingerprint = ? ORDER BY last_used_at DESC`, [
-            sessionKey, model, this.messagePrefixHash(body, index), this.toolFingerprint(calls)
+            sessionKey, model, this.messagePrefixHash(body, index), this.toolFingerprint(calls, schemas)
           ]);
           if (stableRows.length === 1) {
             row = stableRows[0];
@@ -287,7 +315,7 @@ class ReplayStore {
           if (!row) {
             const predicates = calls.map(() => "instr(assistant_text, ?) > 0").join(" AND ");
             const candidates = this.matchingRows(`${select} AND ${predicates} ORDER BY last_used_at DESC`, [sessionKey, model, ...calls.map((call) => `<tool_call id="${call.id}" name="${call.name}">`)]);
-            const semanticRows = this.matchingToolHistory(candidates, calls);
+            const semanticRows = this.matchingToolHistory(candidates, calls, schemas);
             if (semanticRows.length === 1) {
               row = semanticRows[0];
               this.logReplayFallback("legacy semantic tool-call", semanticRows.length);

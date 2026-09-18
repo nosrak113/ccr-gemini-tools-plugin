@@ -112,6 +112,28 @@ test("canonical tool fingerprints ignore input object key order", () => {
   assert.deepEqual(restored, history);
 });
 
+test("replay matching ignores tool-schema defaults injected by Claude Desktop", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const tools = [{ name: "Edit", input_schema: { type: "object", properties: {
+    file_path: { type: "string" },
+    old_string: { type: "string" },
+    new_string: { type: "string" },
+    replace_all: { type: "boolean", default: false }
+  } } }];
+  const first = { system: "Desktop context one", tools, messages: [{ role: "user", content: "Add a property" }] };
+  const storedCall = { id: "edit-default", name: "Edit", input: { file_path: "/tmp/example.swift", old_string: "before", new_string: "after" } };
+  const desktopCall = { id: "edit-default", name: "Edit", input: { new_string: "after", replace_all: false, old_string: "before", file_path: "/tmp/example.swift" } };
+  const history = [{ type: "function_call", id: storedCall.id, name: storedCall.name, arguments: storedCall.input }];
+  replay.saveReplay("desktop-default", first, "gemini-3.8-flash", '<tool_call id="edit-default" name="Edit">{}</tool_call>', history, [storedCall]);
+
+  const restored = replay.restoreForRequest("desktop-default", {
+    system: "Desktop context two",
+    messages: [...first.messages, { role: "assistant", content: [{ type: "tool_use", ...desktopCall }] }]
+  }, "gemini-3.8-flash");
+
+  assert.deepEqual(restored, history);
+});
+
 test("stable replay matching preserves local tool-call order", () => {
   const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
   const first = { system: "Desktop context one", messages: [{ role: "user", content: "Inspect both files" }] };
