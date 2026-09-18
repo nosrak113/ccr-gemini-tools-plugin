@@ -22,6 +22,12 @@ const DESKTOP_MODELS = Object.freeze({
 });
 const BRIDGE_TOOLS = new Set(["WebSearch", "WebFetch", "CodeExecution"]);
 const MAX_TOOL_ROUNDS = 12;
+// Claude Desktop may materialize these defaults in its persisted transcript even
+// when the streamed Gemini function call omitted them. Retries do not always
+// include the original tool schemas, so preserve the same semantics there.
+const CLAUDE_DESKTOP_TOOL_DEFAULTS = Object.freeze({
+  Edit: Object.freeze({ replace_all: Object.freeze({ default: false }) })
+});
 
 function fail(status, message, type = "api_error") {
   const error = new Error(message);
@@ -45,7 +51,7 @@ function normalizeModel(model) {
   const original = String(model || "");
   const encoded = original.match(/(?:^|\/)claude-ccr-h([0-9a-f]+)$/i);
   if (encoded && encoded[1].length % 2 === 0) {
-    const underlying = Buffer.from(encoded[1], "hex").toString("utf8").toLowerCase();
+    const underlying = Buffer.from(encoded[1], "hex").toString("utf8").toLowerCase().replace(/^(google|googleagent)\//, "");
     if (underlying === "gemini-flash-latest") return MODELS.primary;
     if (underlying === "gemini-pro-latest") return MODELS.preview;
     if (underlying === "gemini-flash-lite-latest") return MODELS.helper;
@@ -95,6 +101,57 @@ function functionResult(call, result) {
     name: call.name,
     call_id: call.id,
     result: [{ type: "text", text: result }]
+  };
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
+}
+
+function canonicalJson(value) {
+  return JSON.stringify(canonicalize(value));
+}
+
+function hash(value) {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function normalizeInputWithSchema(value, schema) {
+  if (Array.isArray(value)) return value.map((item) => normalizeInputWithSchema(item, schema?.items));
+  if (!value || typeof value !== "object") return value;
+  const properties = schema?.properties || {};
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, item]) => !Object.hasOwn(properties, key) || !Object.hasOwn(properties[key] || {}, "default") || canonicalJson(item) !== canonicalJson(properties[key].default))
+    .map(([key, item]) => [key, normalizeInputWithSchema(item, properties[key])]));
+}
+
+function toolSchemas(tools) {
+  return new Map((tools || [])
+    .filter((tool) => tool?.name && tool.input_schema)
+    .map((tool) => [tool.name, tool.input_schema]));
+}
+
+function schemaForTool(schemas, name) {
+  const schema = schemas.get(name) || {};
+  const defaults = CLAUDE_DESKTOP_TOOL_DEFAULTS[name] || {};
+  return { ...schema, properties: { ...defaults, ...(schema.properties || {}) } };
+}
+
+function localCallIdentity(calls, schemas = new Map()) {
+  return (calls || []).map((call) => ({
+    id: String(call.id || ""),
+    name: String(call.name || ""),
+    input: normalizeInputWithSchema(call.input ?? {}, schemaForTool(schemas, call.name))
+  }));
+}
+
+function functionCallIdentity(step) {
+  return {
+    id: String(step.id || step.call_id || ""),
+    name: String(step.name || ""),
+    input: step.arguments ?? step.args ?? {}
   };
 }
 
@@ -172,42 +229,104 @@ function citations(interaction) {
 }
 
 class ReplayStore {
-  constructor(directory) {
+  constructor(directory, logger = null) {
+    this.logger = logger;
     this.db = new DatabaseSync(join(directory, "gemini-agent-replay.sqlite"));
     // Concurrent gateway requests may share this replay database. WAL lets readers
     // proceed while a replay is written, and the timeout avoids transient BUSY
     // failures when two tool turns finish together.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.db.exec("CREATE TABLE IF NOT EXISTS replays (id TEXT PRIMARY KEY, session_key TEXT NOT NULL, model TEXT NOT NULL, prefix_hash TEXT NOT NULL, assistant_text TEXT NOT NULL, history_json TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL)");
+    const columns = new Set(this.db.prepare("PRAGMA table_info(replays)").all().map((column) => column.name));
+    if (!columns.has("message_prefix_hash")) this.db.exec("ALTER TABLE replays ADD COLUMN message_prefix_hash TEXT");
+    if (!columns.has("tool_fingerprint")) this.db.exec("ALTER TABLE replays ADD COLUMN tool_fingerprint TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS replays_lookup ON replays(session_key, model, prefix_hash, last_used_at DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS replays_stable_lookup ON replays(session_key, model, message_prefix_hash, tool_fingerprint, last_used_at DESC)");
   }
   prefixHash(body, beforeIndex) {
     return createHash("sha256").update(JSON.stringify({ system: body.system || "", messages: (body.messages || []).slice(0, beforeIndex) })).digest("hex");
   }
-  saveReplay(sessionKey, body, model, assistantText, history) {
+  messagePrefixHash(body, beforeIndex) {
+    return hash({ messages: (body.messages || []).slice(0, beforeIndex) });
+  }
+  toolFingerprint(calls, schemas) {
+    return hash(localCallIdentity(calls, schemas));
+  }
+  saveReplay(sessionKey, body, model, assistantText, history, calls = []) {
     const now = Date.now();
-    this.db.prepare("INSERT INTO replays VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), sessionKey, model, this.prefixHash(body, (body.messages || []).length), assistantText, JSON.stringify(history), now, now);
+    this.db.prepare("INSERT INTO replays (id, session_key, model, prefix_hash, assistant_text, history_json, created_at, last_used_at, message_prefix_hash, tool_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(randomUUID(), sessionKey, model, this.prefixHash(body, (body.messages || []).length), assistantText, JSON.stringify(history), now, now, this.messagePrefixHash(body, (body.messages || []).length), this.toolFingerprint(calls, toolSchemas(body.tools)));
+  }
+  matchingRows(query, parameters) {
+    return this.db.prepare(query).all(...parameters);
+  }
+  matchingToolHistory(rows, calls, schemas) {
+    const expected = localCallIdentity(calls, schemas).map(canonicalJson);
+    return rows.filter((row) => {
+      let history;
+      try { history = JSON.parse(row.history_json); } catch { return false; }
+      const available = history.filter((step) => step?.type === "function_call").map(functionCallIdentity).map((call) => ({ ...call, input: normalizeInputWithSchema(call.input, schemaForTool(schemas, call.name)) })).map(canonicalJson);
+      let from = 0;
+      for (const call of expected) {
+        const found = available.indexOf(call, from);
+        if (found < 0) return false;
+        from = found + 1;
+      }
+      return true;
+    });
+  }
+  logReplayFallback(strategy, candidates) {
+    this.logger?.info(`Gemini replay restored using ${strategy} matching (${candidates} candidate${candidates === 1 ? "" : "s"}).`);
+  }
+  logReplayFailure(kind, candidates) {
+    this.logger?.warn(`Gemini replay restoration ${kind} after evaluating ${candidates} candidate${candidates === 1 ? "" : "s"}.`);
   }
   restoreForRequest(sessionKey, body, model) {
     const messages = body.messages || [];
+    const schemas = toolSchemas(body.tools);
     const dialogue = [];
     for (let index = 0; index < messages.length; index += 1) {
       const message = messages[index] || {};
       if (message.role === "assistant") {
         const assistantText = turnText(message);
-        let row = this.db.prepare("SELECT id, history_json FROM replays WHERE session_key = ? AND model = ? AND prefix_hash = ? AND assistant_text = ? ORDER BY last_used_at DESC LIMIT 1")
-          .get(sessionKey, model, this.prefixHash(body, index), assistantText);
+        const select = "SELECT id, assistant_text, history_json FROM replays WHERE session_key = ? AND model = ?";
+        let row = this.matchingRows(`${select} AND prefix_hash = ? AND assistant_text = ? ORDER BY last_used_at DESC LIMIT 1`, [sessionKey, model, this.prefixHash(body, index), assistantText])[0];
         const calls = toolUses(message);
-        // Claude Desktop updates its injected system context between tool turns.
-        // The transcript prefix then changes even though the function-call IDs
-        // still identify the exact native interaction that must be replayed.
         if (!row && calls.length) {
-          const predicates = calls.map(() => "instr(assistant_text, ?) > 0").join(" AND ");
-          const candidates = this.db.prepare(`SELECT id, history_json FROM replays WHERE session_key = ? AND model = ? AND ${predicates} ORDER BY last_used_at DESC LIMIT 2`)
-            .all(sessionKey, model, ...calls.map((call) => `<tool_call id="${call.id}" name="${call.name}">`));
-          if (candidates.length === 1) row = candidates[0];
-          else if (!candidates.length) throw fail(409, "Cannot resume this local tool call because its Gemini replay state is unavailable. Restart the conversation from before the tool call.", "replay_state_missing");
-          else throw fail(409, "Cannot resume this local tool call because its Gemini replay state is ambiguous. Restart the conversation from before the tool call.", "replay_state_ambiguous");
+          const stableRows = this.matchingRows(`${select} AND message_prefix_hash = ? AND tool_fingerprint = ? ORDER BY last_used_at DESC`, [
+            sessionKey, model, this.messagePrefixHash(body, index), this.toolFingerprint(calls, schemas)
+          ]);
+          if (stableRows.length === 1) {
+            row = stableRows[0];
+            this.logReplayFallback("stable transcript and tool fingerprint", stableRows.length);
+          }
+
+          // Replays created before the stable columns existed have no fingerprint.
+          // First use their exact assistant content, then compare stored Gemini calls
+          // structurally so object key order cannot make a valid replay ambiguous.
+          if (!row) {
+            const assistantRows = this.matchingRows(`${select} AND assistant_text = ? ORDER BY last_used_at DESC`, [sessionKey, model, assistantText]);
+            if (assistantRows.length === 1) {
+              row = assistantRows[0];
+              this.logReplayFallback("exact assistant content", assistantRows.length);
+            }
+          }
+
+          if (!row) {
+            const predicates = calls.map(() => "instr(assistant_text, ?) > 0").join(" AND ");
+            const candidates = this.matchingRows(`${select} AND ${predicates} ORDER BY last_used_at DESC`, [sessionKey, model, ...calls.map((call) => `<tool_call id="${call.id}" name="${call.name}">`)]);
+            const semanticRows = this.matchingToolHistory(candidates, calls, schemas);
+            if (semanticRows.length === 1) {
+              row = semanticRows[0];
+              this.logReplayFallback("legacy semantic tool-call", semanticRows.length);
+            } else if (!semanticRows.length) {
+              this.logReplayFailure("was unavailable", candidates.length);
+              throw fail(409, "Cannot resume this local tool call because its Gemini replay state is unavailable. Restart the conversation from before the tool call.", "replay_state_missing");
+            } else {
+              this.logReplayFailure("was ambiguous", semanticRows.length);
+              throw fail(409, "Cannot resume this local tool call because its Gemini replay state is ambiguous. Restart the conversation from before the tool call.", "replay_state_ambiguous");
+            }
+          }
         }
         if (row) {
           this.db.prepare("UPDATE replays SET last_used_at = ? WHERE id = ?").run(Date.now(), row.id);
@@ -361,7 +480,7 @@ async function executeAnthropicRequest({ body, client, replay, signal, sessionKe
     const stop_reason = localCalls.length ? "tool_use" : (truncated ? "max_tokens" : "end_turn");
     const response = { id: `msg_${randomUUID().replace(/-/g, "")}`, type: "message", role: "assistant", model: body.model, content: content.length ? content : [{ type: "text", text: "" }], stop_reason, stop_sequence: null, usage: { input_tokens: latest.usage?.total_input_tokens || 0, output_tokens: latest.usage?.total_output_tokens || 0 } };
     if (!stepsAppended) dialogue.push(...(latest.steps || []));
-    replay.saveReplay(sessionKey, body, model, turnText({ role: "assistant", content: response.content }), dialogue);
+    replay.saveReplay(sessionKey, body, model, turnText({ role: "assistant", content: response.content }), dialogue, localCalls);
     return response;
   }
   throw fail(429, `GoogleAgent exceeded its ${MAX_TOOL_ROUNDS} native-tool-round limit.`, "tool_limit_error");

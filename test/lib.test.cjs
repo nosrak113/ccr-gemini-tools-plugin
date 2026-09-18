@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const { mkdtempSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
 const { GeminiClient, ReplayStore, executeAnthropicRequest, toolDeclarations, generationConfig, normalizeModel, sse } = require("../lib.cjs");
 
 test("maps pinned models and rejects unknown models", () => {
@@ -16,6 +17,7 @@ test("maps pinned models and rejects unknown models", () => {
   assert.equal(normalizeModel("fable"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d666c6173682d6c6174657374"), "gemini-3.8-flash");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d70726f2d6c6174657374"), "gemini-3.1-pro-preview");
+  assert.equal(normalizeModel("anthropic/claude-ccr-h476f6f676c652f67656d696e692d70726f2d6c6174657374"), "gemini-3.1-pro-preview");
   assert.equal(normalizeModel("anthropic/claude-ccr-h47656d696e692d666c6173682d6c6974652d6c6174657374"), "gemini-3.5-flash-lite");
   assert.throws(() => normalizeModel("GoogleAgent/gemini-2.5-pro"), /Unsupported/);
 });
@@ -73,6 +75,120 @@ test("restores local-tool replay by exact tool ID when Desktop changes its syste
   assert.deepEqual(restored, [...history, {
     type: "function_result", name: "Read", call_id: "read-unique-1", result: [{ type: "text", text: "Failed to read" }]
   }]);
+});
+
+test("restores the right replay when a session reuses a tool ID with different inputs", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const first = { system: "Desktop context one", messages: [{ role: "user", content: "Read the first file" }] };
+  const second = { system: "Desktop context one", messages: [{ role: "user", content: "Read the second file" }] };
+  const firstCall = { id: "reused-call", name: "Read", input: { file_path: "/tmp/first.txt" } };
+  const secondCall = { id: "reused-call", name: "Read", input: { file_path: "/tmp/second.txt" } };
+  const firstHistory = [{ type: "user_input", content: [{ type: "text", text: "first history" }] }, { type: "function_call", id: firstCall.id, name: firstCall.name, arguments: firstCall.input }];
+  const secondHistory = [{ type: "user_input", content: [{ type: "text", text: "second history" }] }, { type: "function_call", id: secondCall.id, name: secondCall.name, arguments: secondCall.input }];
+  replay.saveReplay("reused-id", first, "gemini-3.8-flash", '<tool_call id="reused-call" name="Read">{"file_path":"/tmp/first.txt"}</tool_call>', firstHistory, [firstCall]);
+  replay.saveReplay("reused-id", second, "gemini-3.8-flash", '<tool_call id="reused-call" name="Read">{"file_path":"/tmp/second.txt"}</tool_call>', secondHistory, [secondCall]);
+
+  const restored = replay.restoreForRequest("reused-id", {
+    system: "Desktop context two",
+    messages: [...second.messages, { role: "assistant", content: [{ type: "tool_use", ...secondCall }] }]
+  }, "gemini-3.8-flash");
+
+  assert.deepEqual(restored, secondHistory);
+});
+
+test("canonical tool fingerprints ignore input object key order", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const first = { system: "Desktop context one", messages: [{ role: "user", content: "List matching files" }] };
+  const storedCall = { id: "ordered-call", name: "Glob", input: { path: "/tmp", filters: { extension: "txt", hidden: false } } };
+  const requestCall = { id: "ordered-call", name: "Glob", input: { filters: { hidden: false, extension: "txt" }, path: "/tmp" } };
+  const history = [{ type: "function_call", id: storedCall.id, name: storedCall.name, arguments: storedCall.input }];
+  replay.saveReplay("key-order", first, "gemini-3.8-flash", '<tool_call id="ordered-call" name="Glob">{"path":"/tmp","filters":{"extension":"txt","hidden":false}}</tool_call>', history, [storedCall]);
+
+  const restored = replay.restoreForRequest("key-order", {
+    system: "Desktop context two",
+    messages: [...first.messages, { role: "assistant", content: [{ type: "tool_use", ...requestCall }] }]
+  }, "gemini-3.8-flash");
+
+  assert.deepEqual(restored, history);
+});
+
+test("replay matching ignores tool-schema defaults injected by Claude Desktop", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const tools = [{ name: "Edit", input_schema: { type: "object", properties: {
+    file_path: { type: "string" },
+    old_string: { type: "string" },
+    new_string: { type: "string" },
+    replace_all: { type: "boolean", default: false }
+  } } }];
+  const first = { system: "Desktop context one", tools, messages: [{ role: "user", content: "Add a property" }] };
+  const storedCall = { id: "edit-default", name: "Edit", input: { file_path: "/tmp/example.swift", old_string: "before", new_string: "after" } };
+  const desktopCall = { id: "edit-default", name: "Edit", input: { new_string: "after", replace_all: false, old_string: "before", file_path: "/tmp/example.swift" } };
+  const history = [{ type: "function_call", id: storedCall.id, name: storedCall.name, arguments: storedCall.input }];
+  replay.saveReplay("desktop-default", first, "gemini-3.8-flash", '<tool_call id="edit-default" name="Edit">{}</tool_call>', history, [storedCall]);
+
+  const restored = replay.restoreForRequest("desktop-default", {
+    system: "Desktop context two",
+    messages: [...first.messages, { role: "assistant", content: [{ type: "tool_use", ...desktopCall }] }]
+  }, "gemini-3.8-flash");
+
+  assert.deepEqual(restored, history);
+});
+
+test("stable replay matching preserves local tool-call order", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const first = { system: "Desktop context one", messages: [{ role: "user", content: "Inspect both files" }] };
+  const read = { id: "read-1", name: "Read", input: { file_path: "/tmp/a" } };
+  const stat = { id: "stat-1", name: "Bash", input: { command: "stat /tmp/a" } };
+  const firstHistory = [{ type: "user_input", content: [{ type: "text", text: "read then stat" }] }, { type: "function_call", id: read.id, name: read.name, arguments: read.input }, { type: "function_call", id: stat.id, name: stat.name, arguments: stat.input }];
+  const secondHistory = [{ type: "user_input", content: [{ type: "text", text: "stat then read" }] }, { type: "function_call", id: stat.id, name: stat.name, arguments: stat.input }, { type: "function_call", id: read.id, name: read.name, arguments: read.input }];
+  replay.saveReplay("ordered-calls", first, "gemini-3.8-flash", "read then stat", firstHistory, [read, stat]);
+  replay.saveReplay("ordered-calls", first, "gemini-3.8-flash", "stat then read", secondHistory, [stat, read]);
+
+  const restored = replay.restoreForRequest("ordered-calls", {
+    system: "Desktop context two",
+    messages: [...first.messages, { role: "assistant", content: [{ type: "tool_use", ...stat }, { type: "tool_use", ...read }] }]
+  }, "gemini-3.8-flash");
+
+  assert.deepEqual(restored, secondHistory);
+});
+
+test("migrates and semantically restores pre-fingerprint replay rows", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gemini-agent-replay-"));
+  const db = new DatabaseSync(join(directory, "gemini-agent-replay.sqlite"));
+  db.exec("CREATE TABLE replays (id TEXT PRIMARY KEY, session_key TEXT NOT NULL, model TEXT NOT NULL, prefix_hash TEXT NOT NULL, assistant_text TEXT NOT NULL, history_json TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL)");
+  const storedCall = { id: "legacy-call", name: "Read", input: { file_path: "/tmp/legacy.txt", options: { line_end: 2, line_start: 1 } } };
+  const history = [{ type: "function_call", id: storedCall.id, name: storedCall.name, arguments: storedCall.input }];
+  const now = Date.now();
+  db.prepare("INSERT INTO replays VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("legacy-row", "legacy-session", "gemini-3.8-flash", "old-prefix", '<tool_call id="legacy-call" name="Read">{"file_path":"/tmp/legacy.txt","options":{"line_end":2,"line_start":1}}</tool_call>', JSON.stringify(history), now, now);
+  db.close();
+
+  const replay = new ReplayStore(directory);
+  const columns = replay.db.prepare("PRAGMA table_info(replays)").all().map((column) => column.name);
+  assert.equal(columns.includes("message_prefix_hash"), true);
+  assert.equal(columns.includes("tool_fingerprint"), true);
+  const requestCall = { id: "legacy-call", name: "Read", input: { options: { line_start: 1, line_end: 2 }, file_path: "/tmp/legacy.txt" } };
+  const restored = replay.restoreForRequest("legacy-session", {
+    system: "new desktop context",
+    messages: [{ role: "user", content: "Read the legacy file" }, { role: "assistant", content: [{ type: "tool_use", ...requestCall }] }]
+  }, "gemini-3.8-flash");
+
+  assert.deepEqual(restored, history);
+});
+
+test("keeps a 409 when duplicate tool-call histories remain irreducibly ambiguous", () => {
+  const replay = new ReplayStore(mkdtempSync(join(tmpdir(), "gemini-agent-replay-")));
+  const first = { system: "Desktop context one", messages: [{ role: "user", content: "Read the file" }] };
+  const call = { id: "same-call", name: "Read", input: { file_path: "/tmp/same.txt" } };
+  const firstHistory = [{ type: "user_input", content: [{ type: "text", text: "first candidate" }] }, { type: "function_call", id: call.id, name: call.name, arguments: call.input }];
+  const secondHistory = [{ type: "user_input", content: [{ type: "text", text: "second candidate" }] }, { type: "function_call", id: call.id, name: call.name, arguments: call.input }];
+  const serializedCall = '<tool_call id="same-call" name="Read">{"file_path":"/tmp/same.txt"}</tool_call>';
+  replay.saveReplay("ambiguous", first, "gemini-3.8-flash", `first response\n${serializedCall}`, firstHistory, [call]);
+  replay.saveReplay("ambiguous", first, "gemini-3.8-flash", `second response\n${serializedCall}`, secondHistory, [call]);
+
+  assert.throws(() => replay.restoreForRequest("ambiguous", {
+    system: "Desktop context two",
+    messages: [...first.messages, { role: "assistant", content: [{ type: "tool_use", ...call }] }]
+  }, "gemini-3.8-flash"), (error) => error.status === 409 && error.type === "replay_state_ambiguous");
 });
 
 test("matches replayed tool results against Gemini call_id and retains accompanying user text", () => {
@@ -197,10 +313,11 @@ test("does not duplicate native steps when bridge and local tools are returned t
   const body = { model: "GoogleAgent/gemini-3.8-flash", messages: [{ role: "user", content: "Search, then run pwd" }], tools: [{ type: "web_search_20250305" }, { name: "Bash", input_schema: { type: "object" } }] };
   const message = await executeAnthropicRequest({ body, client, replay });
   assert.equal(message.stop_reason, "tool_use");
-  const stored = replay.db.prepare("SELECT history_json FROM replays").get();
+  const stored = replay.db.prepare("SELECT history_json, tool_fingerprint FROM replays").get();
   const history = JSON.parse(stored.history_json);
   assert.equal(history.filter((step) => step.type === "function_call" && step.id === "search-1").length, 1);
   assert.equal(history.filter((step) => step.type === "function_call" && step.id === "bash-1").length, 1);
+  assert.equal(typeof stored.tool_fingerprint, "string");
 });
 
 test("returns bridge worker failures to Gemini as function results", async () => {
