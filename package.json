@@ -1,6 +1,6 @@
 {
   "name": "ccr-gemini-agent",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "private": true,
   "description": "Gemini Interactions bridge for Claude Code Router",
   "scripts": {

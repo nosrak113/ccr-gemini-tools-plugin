@@ -59,6 +59,16 @@ test("count_tokens includes both system and messages", async () => {
   bridge.stop();
 });
 
+test("health reports the replay-correlation patch version", async () => {
+  const fixture = makeContext();
+  await bridge.setup(fixture.ctx);
+  const route = fixture.routes.find((candidate) => candidate.path === "/plugins/gemini-agent/health");
+  const result = await route.handler({}, {}, jsonHelpers({}));
+  assert.equal(result.status, 200);
+  assert.equal(result.value.version, "0.2.2");
+  bridge.stop();
+});
+
 test("SSE errors are emitted and closed after headers have been sent", () => {
   const response = new EventEmitter();
   let output = "";

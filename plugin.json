@@ -1,7 +1,7 @@
 {
   "id": "ccr-gemini-agent",
   "name": "Gemini Agent Bridge",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "module": "index.cjs",
   "surfaces": ["gateway"],
   "permissions": ["trusted-code", "gateway-routes"]
